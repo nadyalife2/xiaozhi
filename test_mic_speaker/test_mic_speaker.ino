@@ -1,255 +1,282 @@
 // =================================================================
-// ТЕСТ МИКРОФОНА И ДИНАМИКА — MUMA 1.54 / ESP32-S3
-// БЕЗ внешних зависимостей (Audio.h не нужен!)
-// Требуется только стандартный ESP32-S3 пакет в Arduino IDE
+// TEST_PINS v3 — Проверка микрофона и динамика
+// Плата: Spotpear MUMA 1.54 / ESP32-1.54inch-AI-V2
+//
+// ПОЧЕМУ БЫЛИ НУЛИ:
+//   При I2S_MODE_RX без TX и fixed_mclk=0
+//   ESP32-S3 НЕ выводит MCLK на GPIO16.
+//   ES8311 без MCLK = ADC молчит = DMA нули.
+//
+// РЕШЕНИЕ: full-duplex TX|RX + fixed_mclk = SAMPLE_RATE*256
+//   Тогда MCLK генерируется всегда.
 // =================================================================
 
 #include <Arduino.h>
-#include <driver/i2s.h>
 #include <Wire.h>
+#include <driver/i2s.h>
 #include <math.h>
 
-// --- ПИНЫ (из рабочей прошивки MELVIN v3.7.4) ---
-#define I2C_SDA    15
-#define I2C_SCL    14
-#define I2S_MCLK   16
-#define I2S_BCLK    9
-#define I2S_LRC    45
-#define I2S_DOUT    8
-#define I2S_DIN    10
-#define PA_ENABLE  46
+// --- ПИНЫ ---
+#define I2C_SDA     15
+#define I2C_SCL     14
+#define I2S_MCLK    16
+#define I2S_BCLK     9
+#define I2S_LRC     45
+#define I2S_DOUT     8
+#define I2S_DIN     10
+#define PA_ENABLE   46
 
-bool i2sDriverInstalled = false;
+#define SAMPLE_RATE      16000
+#define MCLK_FREQ        (SAMPLE_RATE * 256)   // 4 096 000 Hz
+#define TEST_TONE_HZ      1000
+#define BLOCK_SIZE         256
+#define MIC_SILENCE_THR    100
 
 // =================================================================
-// ES8311 — инициализация кодека
+// ES8311
 // =================================================================
+static void es_wr(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(0x18);
+  Wire.write(reg); Wire.write(val);
+  Wire.endTransmission();
+}
+static uint8_t es_rd(uint8_t reg) {
+  Wire.beginTransmission(0x18);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)0x18, (uint8_t)1);
+  return Wire.available() ? Wire.read() : 0xFF;
+}
+
 void initES8311() {
   Wire.begin(I2C_SDA, I2C_SCL);
+  delay(50);
+
+  Wire.beginTransmission(0x18);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("  [ES8311] ❌ Кодек не отвечает!");
+    return;
+  }
+  Serial.printf("  [ES8311] ✅ Найден на 0x18, CHIP_ID=0x%02X\n", es_rd(0xFD));
+
+  es_wr(0x00, 0x1F); delay(20);
+  es_wr(0x00, 0x80); delay(20);
+
+  // Тактирование: MCLK внешний (GPIO16)
+  es_wr(0x01, 0x30);
+  es_wr(0x02, 0x10);
+  es_wr(0x03, 0x10);
+  es_wr(0x04, 0x10);
+  es_wr(0x05, 0x00);
+  es_wr(0x06, 0x03);
   delay(10);
-  auto wr = [](uint8_t r, uint8_t v) {
-    Wire.beginTransmission(0x18); Wire.write(r); Wire.write(v); Wire.endTransmission();
-  };
-  wr(0x01, 0x30); delay(10);
-  wr(0x01, 0x00); wr(0x02, 0x00); wr(0x03, 0x10);
-  wr(0x16, 0x11); wr(0x17, 0x11); wr(0x14, 0x1A); wr(0x15, 0x1A);
-  wr(0x0B, 0x00); wr(0x0C, 0x00); wr(0x10, 0x00); wr(0x11, 0xFC);
-  wr(0x00, 0x80);
-  wr(0x0D, 0x01); wr(0x0E, 0x02); wr(0x12, 0x28); wr(0x13, 0x06);
-  pinMode(PA_ENABLE, OUTPUT);
-  digitalWrite(PA_ENABLE, LOW);
+
+  // AIF: I2S, 16 бит
+  es_wr(0x0B, 0x00);
+  es_wr(0x0C, 0x00);
+  delay(5);
+
+  // Power
+  es_wr(0x0D, 0x01); delay(10);
+  es_wr(0x0E, 0x02);
+  es_wr(0x0F, 0x44); delay(20);
+
+  // MIC PGA +18dB
+  es_wr(0x10, 0x28);
+  es_wr(0x11, 0x28);
+  delay(10);
+
+  // ADC
+  es_wr(0x15, 0x00);
+  es_wr(0x16, 0x00);
+  es_wr(0x17, 0x88);
+  delay(10);
+
+  // DAC
+  es_wr(0x32, 0xBF);
+  es_wr(0x37, 0x08);
+  delay(10);
+
+  Serial.printf("  [ES8311] MIC_PGA=0x%02X ADC_PWR=0x%02X ADC=0x%02X CLK=0x%02X\n",
+                es_rd(0x10), es_rd(0x17), es_rd(0x16), es_rd(0x02));
 }
 
 // =================================================================
-// I2S TX — динамик (raw I2S, без Audio.h)
+// I2S full-duplex (TX+RX одновременно)
+// fixed_mclk гарантирует вывод MCLK на GPIO16
 // =================================================================
-void i2s_install_tx() {
-  if (i2sDriverInstalled) {
-    i2s_driver_uninstall(I2S_NUM_0);
-    delay(50);
-    i2sDriverInstalled = false;
-  }
+void i2s_install_duplex() {
   i2s_config_t cfg = {
-    .mode             = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-    .sample_rate      = 16000,
+    .mode             = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_RX),
+    .sample_rate      = SAMPLE_RATE,
     .bits_per_sample  = I2S_BITS_PER_SAMPLE_16BIT,
     .channel_format   = I2S_CHANNEL_FMT_RIGHT_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count    = 8,
-    .dma_buf_len      = 512,
-    .use_apll         = false,
+    .dma_buf_len      = BLOCK_SIZE,
+    .use_apll         = true,
     .tx_desc_auto_clear = true,
-    .fixed_mclk       = 0    // КЛЮЧЕВО: 0, не 4096000!
+    .fixed_mclk       = MCLK_FREQ   // ← МУСТ БЫТЬ! MCLK всегда активен
   };
   i2s_pin_config_t pins = {
     .mck_io_num   = I2S_MCLK,
     .bck_io_num   = I2S_BCLK,
     .ws_io_num    = I2S_LRC,
     .data_out_num = I2S_DOUT,
-    .data_in_num  = I2S_PIN_NO_CHANGE
-  };
-  i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL);
-  i2s_set_pin(I2S_NUM_0, &pins);
-  i2s_zero_dma_buffer(I2S_NUM_0);
-  i2sDriverInstalled = true;
-  delay(50);
-  digitalWrite(PA_ENABLE, HIGH);
-}
-
-// =================================================================
-// I2S RX — микрофон (fixed_mclk=0, как в рабочей прошивке!)
-// =================================================================
-void i2s_install_rx() {
-  if (i2sDriverInstalled) {
-    i2s_driver_uninstall(I2S_NUM_0);
-    delay(50);
-    i2sDriverInstalled = false;
-  }
-  i2s_config_t cfg = {
-    .mode             = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-    .sample_rate      = 16000,
-    .bits_per_sample  = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format   = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count    = 8,
-    .dma_buf_len      = 512,
-    .use_apll         = false,
-    .tx_desc_auto_clear = false,
-    .fixed_mclk       = 0    // КЛЮЧЕВО: 0, не 4096000!
-  };
-  i2s_pin_config_t pins = {
-    .mck_io_num   = I2S_MCLK,
-    .bck_io_num   = I2S_BCLK,
-    .ws_io_num    = I2S_LRC,
-    .data_out_num = I2S_PIN_NO_CHANGE,
     .data_in_num  = I2S_DIN
   };
-  i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL);
+  esp_err_t err = i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL);
+  if (err != ESP_OK) Serial.printf("  [I2S] install err: %d\n", err);
   i2s_set_pin(I2S_NUM_0, &pins);
   i2s_zero_dma_buffer(I2S_NUM_0);
-  i2sDriverInstalled = true;
+  delay(100);
 }
 
 // =================================================================
-// ТЕСТ ДИНАМИКА — синусоидальный тон 1 кГц, 2 секунды
+// ТЕСТ ДИНАМИКА — тон 1кГц, 3 секунды
 // =================================================================
 void testSpeaker() {
-  Serial.println("\n--- ТЕСТ ДИНАМИКА ---");
-  Serial.println("Генерирую тон 1 кГц на 2 секунды...");
+  Serial.println("\n=============================");
+  Serial.println("ТЕСТ ДИНАМИКА (тон 1кГц, 3с)");
+  Serial.println("=============================");
 
-  i2s_install_tx();
+  i2s_install_duplex();
+  digitalWrite(PA_ENABLE, HIGH);
+  delay(100);
 
-  const int SAMPLE_RATE   = 16000;
-  const int FREQ          = 1000;
-  const int DURATION_MS   = 2000;
-  const int AMPLITUDE     = 20000;
-  const int TOTAL_SAMPLES = SAMPLE_RATE * DURATION_MS / 1000;
-
-  int16_t buf[256];
-  int sent = 0;
+  int16_t buf[BLOCK_SIZE * 2];
   size_t written = 0;
+  int phase = 0;
+  const int PERIOD = SAMPLE_RATE / TEST_TONE_HZ;
+  const int TOTAL  = SAMPLE_RATE * 3;
 
-  while (sent < TOTAL_SAMPLES) {
-    int chunk = min(256, TOTAL_SAMPLES - sent);
-    for (int i = 0; i < chunk; i++) {
-      int16_t s = (int16_t)(AMPLITUDE * sin(2.0 * PI * FREQ * (sent + i) / SAMPLE_RATE));
-      buf[i] = s;
+  Serial.println("  ▶ Воспроизвожу тон 1кГц...");
+  for (int i = 0; i < TOTAL; i += BLOCK_SIZE) {
+    for (int j = 0; j < BLOCK_SIZE; j++) {
+      int16_t s = (int16_t)(sinf(2.0f * M_PI * phase / PERIOD) * 8000);
+      buf[j * 2]     = s;
+      buf[j * 2 + 1] = s;
+      phase = (phase + 1) % PERIOD;
     }
-    i2s_write(I2S_NUM_0, buf, chunk * sizeof(int16_t), &written, pdMS_TO_TICKS(100));
-    sent += chunk;
+    i2s_write(I2S_NUM_0, buf, sizeof(buf), &written, portMAX_DELAY);
   }
+  Serial.println("  ✅ Тон отправлен!");
 
-  delay(200);
+  i2s_driver_uninstall(I2S_NUM_0);
   digitalWrite(PA_ENABLE, LOW);
-  Serial.println("✅ Тон отправлен. Если слышишь звук — динамик работает!");
+  delay(200);
 }
 
 // =================================================================
-// ТЕСТ МИКРОФОНА — 3 секунды запись, анализ RMS/Peak
+// ТЕСТ МИКРОФОНА — full-duplex, 5 секунд
+// TX шлёт тишину, RX читает микрофон
 // =================================================================
 void testMicrophone() {
-  Serial.println("\n--- ТЕСТ МИКРОФОНА ---");
-  Serial.println("Записываю 3 секунды... (говори что-нибудь!)");
+  Serial.println("\n================================");
+  Serial.println("ТЕСТ МИКРОФОНА (full-duplex, 5с)");
+  Serial.println("================================");
+  Serial.println("  ГОВОРИ В МИКРОФОН!\n");
 
-  i2s_install_rx();
+  es_wr(0x17, 0x88);
+  es_wr(0x16, 0x00);
+  delay(20);
 
-  const int RECORD_MS   = 3000;
-  const int BUF_SIZE    = 512;
+  i2s_install_duplex();
 
-  int16_t buf[BUF_SIZE / 2];
-  size_t bytes_read  = 0;
-  int    total_read  = 0;
-  long long sum_sq   = 0;
-  int32_t peak       = 0;
-  long sample_count  = 0;
+  int16_t buf_rx[BLOCK_SIZE * 2];
+  int16_t buf_tx[BLOCK_SIZE * 2];
+  memset(buf_tx, 0, sizeof(buf_tx));
 
-  unsigned long tstart = millis();
-  unsigned long tprint = millis();
+  size_t bytes_read, written;
+  unsigned long start = millis();
+  int32_t maxPeak = 0;
+  bool signalDetected = false;
+  int debugFrames = 0;
 
-  while (millis() - tstart < RECORD_MS) {
-    esp_err_t err = i2s_read(I2S_NUM_0, buf, BUF_SIZE, &bytes_read, pdMS_TO_TICKS(100));
-    if (err == ESP_OK && bytes_read > 0) {
-      int n = bytes_read / 2;
-      for (int i = 0; i < n; i++) {
-        int32_t s = buf[i];
-        sum_sq += (long long)s * s;
-        if (abs(s) > peak) peak = abs(s);
-      }
-      sample_count += n;
-      total_read   += bytes_read;
+  while (millis() - start < 5000) {
+    i2s_write(I2S_NUM_0, buf_tx, sizeof(buf_tx), &written, 0);
+    i2s_read(I2S_NUM_0, buf_rx, sizeof(buf_rx), &bytes_read, pdMS_TO_TICKS(50));
+    int samples = bytes_read / 2;
+    if (samples == 0) continue;
+
+    if (debugFrames < 3) {
+      Serial.printf("  RAW[%d]: ", debugFrames);
+      for (int i = 0; i < min(8, samples); i++)
+        Serial.printf("%6d ", buf_rx[i]);
+      Serial.println();
+      debugFrames++;
     }
-    // Печатаем уровень каждые 200мс
-    if (millis() - tprint > 200) {
-      tprint = millis();
-      long rms = (sample_count > 0) ? (long)sqrt((double)sum_sq / sample_count) : 0;
-      int bars = (int)map(constrain(rms, 0, 5000), 0, 5000, 0, 30);
-      Serial.printf("MIC RMS: %5ld  Peak: %6ld  [", rms, (long)peak);
-      for (int b = 0; b < 30; b++) Serial.print(b < bars ? "|" : " ");
-      Serial.println("]");
+
+    int64_t sum = 0;
+    int16_t peak = 0;
+    for (int i = 0; i < samples; i += 2) {
+      int16_t v = abs(buf_rx[i]);
+      sum += (int32_t)v * v;
+      if (v > peak) peak = v;
     }
+    int rms = (int)sqrtf((float)sum / (samples / 2));
+    if (peak > maxPeak) maxPeak = peak;
+    if (rms > MIC_SILENCE_THR) signalDetected = true;
+
+    int bars = (int)map(constrain(rms, 0, 8000), 0, 8000, 0, 30);
+    char bar[32] = {};
+    for (int i = 0; i < 30; i++) bar[i] = (i < bars) ? '|' : ' ';
+    Serial.printf("  RMS:%5d  Peak:%5d  [%s]%s\n",
+                  rms, peak, bar,
+                  rms > MIC_SILENCE_THR ? " ← СИГНАЛ!" : "");
   }
 
-  long final_rms = (sample_count > 0) ? (long)sqrt((double)sum_sq / sample_count) : 0;
+  i2s_driver_uninstall(I2S_NUM_0);
 
-  Serial.println("\n--- РЕЗУЛЬТАТ ---");
-  Serial.printf("Байт считано: %d\n", total_read);
-  Serial.printf("RMS: %ld\n", final_rms);
-  Serial.printf("Peak: %ld\n", (long)peak);
-
-  if (final_rms > 100) {
-    Serial.println("✅ Микрофон работает! Сигнал есть.");
-  } else if (final_rms > 20) {
-    Serial.println("⚠️  Слабый сигнал. Говори громче или проверь пины.");
+  Serial.println();
+  if (signalDetected) {
+    Serial.printf("  ✅ Микрофон РАБОТАЕТ! MaxPeak=%d\n", (int)maxPeak);
+  } else if (maxPeak > 0) {
+    Serial.printf("  ⚠️  Слабый сигнал (MaxPeak=%d). Говори громче!\n", (int)maxPeak);
   } else {
-    Serial.println("❌ Сигнала нет. Проверь I2S_DIN, I2S_BCLK, I2S_LRC, I2S_MCLK.");
+    Serial.println("  ❌ Сигнал = 0.");
+    Serial.printf("     • GPIO%d (DIN)  → ES8311 ASDOUT?\n", I2S_DIN);
+    Serial.printf("     • GPIO%d (MCLK) → ES8311 MCLK?\n",   I2S_MCLK);
+    Serial.println("     • Питание ES8311: DVDD=1.8V, AVDD=3.3V?");
+    Serial.println("     • Микрофоны подпаяны к MICIP1/MICIN1?");
   }
-
-  // Возвращаемся в TX режим
-  i2s_install_tx();
 }
 
 // =================================================================
 // SETUP
 // =================================================================
 void setup() {
-  // Страп-пин 45 — прижать LOW сразу
   pinMode(45, OUTPUT); digitalWrite(45, LOW);
   delay(100);
 
   Serial.begin(115200);
   delay(2000);
 
-  Serial.println("\n================================");
-  Serial.println("  ТЕСТ МИК И ДИНАМИКА (no libs)");
-  Serial.println("  MUMA 1.54 / ESP32-S3");
-  Serial.println("================================");
+  Serial.println();
+  Serial.println("#####################################");
+  Serial.println("###  TEST_PINS v3                 ###");
+  Serial.println("###  Spotpear MUMA 1.54           ###");
+  Serial.println("###  FIX: full-duplex+fixed_mclk  ###");
+  Serial.println("#####################################");
+  Serial.printf("\nMCLK = %d Hz\n\n", MCLK_FREQ);
 
-  Serial.println("[1] Инициализация ES8311 (I2C)...");
+  pinMode(PA_ENABLE, OUTPUT);
+  digitalWrite(PA_ENABLE, LOW);
+
+  Serial.println("[1/3] Инициализация ES8311...");
   initES8311();
-  delay(200);
+  delay(300);
 
-  Serial.println("[2] Инициализация I2S TX...");
-  i2s_install_tx();
-  delay(200);
+  Serial.println("\n[2/3] Тест динамика...");
+  testSpeaker();
+  delay(500);
 
-  Serial.println("Готов!\n");
-  Serial.println("Команды:");
-  Serial.println("  's' — тест динамика");
-  Serial.println("  'm' — тест микрофона");
-  Serial.println("  'b' — оба подряд");
+  Serial.println("\n[3/3] Тест микрофона (5с, ГОВОРИ!)...");
+  testMicrophone();
+
+  Serial.println("\n=== ТЕСТ ЗАВЕРШЁН ===");
+  Serial.println("Для повтора — нажми RST.");
 }
 
-// =================================================================
-// LOOP
-// =================================================================
-void loop() {
-  if (Serial.available()) {
-    char cmd = (char)Serial.read();
-    if      (cmd == 's' || cmd == 'S') testSpeaker();
-    else if (cmd == 'm' || cmd == 'M') testMicrophone();
-    else if (cmd == 'b' || cmd == 'B') { testSpeaker(); delay(500); testMicrophone(); }
-  }
-  delay(10);
-}
+void loop() { delay(1000); }
